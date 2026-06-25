@@ -4,7 +4,7 @@ Predicts the construction value of City of Edmonton building permits using real 
 
 ## Results
 
-- **204,590 real permits** (2009–2026) from the [City of Edmonton Open Data Portal](https://data.edmonton.ca)
+- **204,590 real permits** (2009–2026) from the [City of Edmonton Open Data Portal]
 - **XGBoost R²=0.84**, ~17% median error on held-out test set
 - Tree ensembles (R²=0.84) outperform linear regression (R²=0.56) by a wide margin
 - Surprising finding: **location barely matters** — neighbourhood and zoning contribute <2% of feature importance. What gets built, not where, drives value.
