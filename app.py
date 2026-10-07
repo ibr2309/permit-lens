@@ -1,13 +1,3 @@
-"""
-permit-lens — Edmonton building permit construction value predictor
-====================================================================
-Run:  streamlit run app.py
-
-Uses artifacts/model.joblib when it was trained on the current dataset
-(build it with `python -m permit_lens.train`); otherwise trains on first launch.
-Point PERMIT_LENS_DATA at the full export from data.edmonton.ca to use all permits.
-"""
-
 import os
 from pathlib import Path
 
