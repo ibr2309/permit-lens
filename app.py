@@ -1,354 +1,308 @@
 """
-Edmonton Building Permit Construction Value Predictor
-=====================================================
-Predicts the declared construction value of a City of Edmonton building permit
-from project characteristics, using 204,590 real permit records (2009-2026)
-from the City of Edmonton Open Data Portal.
-
-Data source: data.edmonton.ca - General Building Permits
+permit-lens — Edmonton building permit construction value predictor
+====================================================================
 Run:  streamlit run app.py
+
+Uses artifacts/model.joblib when it was trained on the current dataset
+(build it with `python -m permit_lens.train`); otherwise trains on first launch.
+Point PERMIT_LENS_DATA at the full export from data.edmonton.ca to use all permits.
 """
 
-import streamlit as st
-import pandas as pd
+import os
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import r2_score, mean_absolute_error
-from xgboost import XGBRegressor
-import warnings
-# Silence only the known-noisy library categories (sklearn/xgboost/plotly),
-# not everything, so genuine issues still surface.
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=UserWarning)
+import streamlit as st
 
-DATA_PATH = "General_Building_Permits_sample.csv"   # 40k-row sample ships with the repo;
-# for the full 204k-permit results, download the complete CSV from data.edmonton.ca
-# and point this at it.
+from permit_lens.data import CATEGORICAL, MAX_VALUE, MIN_VALUE, description_area, load
+from permit_lens.modeling import ALL_FEATURES, predict_with_interval, train_and_evaluate
+from permit_lens.train import load_report, save
 
-st.set_page_config(page_title="Edmonton Permit Value Predictor", page_icon="🏗️",
-                   layout="wide", initial_sidebar_state="expanded")
+DATA_PATH = os.environ.get("PERMIT_LENS_DATA", "General_Building_Permits_sample.csv")
+MODEL_PATH = Path(os.environ.get("PERMIT_LENS_MODEL", "artifacts/model.joblib"))
 
-st.markdown("""
-<style>
-    .stMetric { background: #1a1f2e; border-radius: 10px; padding: 12px; }
-    .section-header { font-size: 1.05rem; font-weight: 600; color: #e2e8f0;
-        border-left: 3px solid #3b82f6; padding-left: 10px; margin: 18px 0 8px 0; }
-    div[data-testid="stSidebar"] { background: #1a1f2e; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="permit-lens · Edmonton permit values", page_icon="🏗️", layout="wide")
 
-FEATURE_COLS = ['years_since_2009', 'MONTH_NUMBER', 'has_floor_area', 'log_fa',
-                'JOB_CATEGORY_enc', 'BUILDING_TYPE_enc', 'WORK_TYPE_enc',
-                'NEIGHBOURHOOD_r_enc', 'ZONING_r_enc']
-NAME_MAP = {'years_since_2009': 'Year', 'MONTH_NUMBER': 'Month',
-            'has_floor_area': 'Floor Area Provided', 'log_fa': 'Floor Area (log)',
-            'JOB_CATEGORY_enc': 'Job Category', 'BUILDING_TYPE_enc': 'Building Type',
-            'WORK_TYPE_enc': 'Work Type', 'NEIGHBOURHOOD_r_enc': 'Neighbourhood',
-            'ZONING_r_enc': 'Zoning'}
+BLUE, GREEN, AMBER, RED, GREY = "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#94a3b8"
 
 
-def reduce_card(s, n):
-    top = s.value_counts().head(n).index
-    return s.where(s.isin(top), 'Other')
+def style(fig, height=340):
+    fig.update_layout(template="plotly_dark", height=height, margin=dict(l=0, r=0, t=10, b=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    return fig
 
 
-@st.cache_data(show_spinner="Loading & cleaning 200k+ permit records...")
-def load_data():
-    usecols = ['YEAR', 'MONTH_NUMBER', 'JOB_CATEGORY', 'BUILDING_TYPE', 'WORK_TYPE',
-               'CONSTRUCTION_VALUE', 'FLOOR_AREA', 'UNITS_ADDED', 'ZONING', 'NEIGHBOURHOOD']
-    df = pd.read_csv(DATA_PATH, usecols=usecols, low_memory=False)
-
-    df['cv'] = pd.to_numeric(df['CONSTRUCTION_VALUE'].astype(str).str.replace('[$,]', '', regex=True), errors='coerce')
-    df['fa'] = pd.to_numeric(df['FLOOR_AREA'].astype(str).str.replace('[,]', '', regex=True), errors='coerce')
-    df.loc[df['fa'] < 0, 'fa'] = np.nan
-    df = df[(df['cv'] >= 500) & (df['cv'] <= 50_000_000)].copy()
-
-    df['log_cv'] = np.log10(df['cv'])
-    df['has_floor_area'] = df['fa'].notna().astype(int)
-    fa_median = float(df['fa'].median())
-    df['log_fa'] = np.log1p(df['fa'].fillna(fa_median).clip(lower=0))
-    df['years_since_2009'] = df['YEAR'] - 2009
-    df['MONTH_NUMBER'] = pd.to_numeric(df['MONTH_NUMBER'], errors='coerce').fillna(0).astype(int)
-    df['NEIGHBOURHOOD_r'] = reduce_card(df['NEIGHBOURHOOD'].fillna('Unknown'), 60)
-    df['ZONING_r'] = reduce_card(df['ZONING'].fillna('Unknown'), 40)
-    for c in ['BUILDING_TYPE', 'JOB_CATEGORY', 'WORK_TYPE']:
-        df[c] = df[c].fillna('Unknown')
-
-    encoders = {}
-    for col in ['JOB_CATEGORY', 'BUILDING_TYPE', 'WORK_TYPE', 'NEIGHBOURHOOD_r', 'ZONING_r']:
-        le = LabelEncoder()
-        df[col + '_enc'] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le
-
-    return df, encoders, fa_median
+def money(x):
+    return f"${x:,.0f}"
 
 
-@st.cache_resource(show_spinner="Training 5 regression models...")
-def train(_df):
-    X, y = _df[FEATURE_COLS], _df['log_cv']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    models = {
-        'Linear Regression': LinearRegression(),
-        'Ridge Regression': Ridge(alpha=1.0),
-        'Random Forest': RandomForestRegressor(n_estimators=80, max_depth=18, random_state=42, n_jobs=-1),
-        'Gradient Boosting': GradientBoostingRegressor(n_estimators=200, learning_rate=0.08, max_depth=5, random_state=42),
-        'XGBoost': XGBRegressor(n_estimators=300, learning_rate=0.08, max_depth=6, random_state=42, verbosity=0, n_jobs=-1),
-    }
-    results, xgb_test = {}, None
-    for name, m in models.items():
-        m.fit(X_train, y_train)
-        p = m.predict(X_test)
-        results[name] = {
-            'r2': round(float(r2_score(y_test, p)), 4),
-            'mae': round(float(mean_absolute_error(10 ** y_test, 10 ** p)), 0),
-            'medape': round(float(np.median(np.abs(10 ** p - 10 ** y_test) / 10 ** y_test) * 100), 1),
-        }
-        if name == 'XGBoost':
-            xgb_test = (10 ** y_test.values, 10 ** p)
-    importance = dict(sorted(
-        {NAME_MAP[c]: round(float(i) * 100, 2) for c, i in zip(FEATURE_COLS, models['XGBoost'].feature_importances_)}.items(),
-        key=lambda x: -x[1]))
-    return models, results, importance, xgb_test
+@st.cache_data(show_spinner="Loading and cleaning permits…")
+def get_data(path):
+    return load(path)
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Training and evaluating models (about a minute on the sample)…")
+def get_report(path, n_rows):
+    if MODEL_PATH.exists():
+        try:
+            report = load_report(MODEL_PATH)
+            if report.meta.get("n_permits") == n_rows:
+                return report
+        except Exception:
+            pass
+    report = train_and_evaluate(get_data(path))
+    try:
+        save(report, MODEL_PATH)
+    except OSError:
+        pass
+    return report
+
+
 try:
-    df, encoders, fa_median = load_data()
+    df = get_data(DATA_PATH)
 except FileNotFoundError:
-    st.error(f"Could not find `{DATA_PATH}`. Download 'General Building Permits' from "
-             "data.edmonton.ca and place the CSV next to app.py (renamed to General_Building_Permits.csv).")
+    st.error(f"Could not find `{DATA_PATH}`. Download 'General Building Permits' as CSV from "
+             "data.edmonton.ca and set the PERMIT_LENS_DATA environment variable to its path.")
     st.stop()
 
-models, results, importance, xgb_test = train(df)
+report = get_report(DATA_PATH, len(df))
+metrics = report.metrics
+best = metrics.loc[report.model_name]
+sp = report.split
+test_label = f"{sp['test_years'][0]}–{sp['test_years'][1]}"
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🏗️ Edmonton Permits\nConstruction Value Predictor")
+    st.markdown("## 🏗️ permit-lens")
+    st.caption("Construction value of City of Edmonton building permits")
+    st.markdown(f"**{len(df):,}** permits · {df['YEAR'].min()}–{df['YEAR'].max()}")
+    st.markdown(f"Model: **{report.model_name}**")
+    st.markdown(f"Out-of-time R² **{best['r2_log']:.2f}** · median error **{best['median_ape']:.0f}%**")
     st.markdown("---")
-    st.markdown(f"**{len(df):,}** real permits")
-    st.markdown(f"{df['YEAR'].min()}–{df['YEAR'].max()} · City of Edmonton")
-    st.markdown(f"${df['cv'].sum()/1e9:.1f}B total declared value")
-    st.caption("Source: data.edmonton.ca open data")
+    page = st.radio("Page", ["Overview", "Model evaluation", "What drives value", "Predict a permit", "Limitations"])
     st.markdown("---")
-    page = st.radio("Navigation", ["📊 Overview & EDA", "🔬 Model Comparison",
-                                    "📈 Feature Analysis", "🔮 Value Predictor"])
+    st.caption(f"Data: data.edmonton.ca (`{Path(DATA_PATH).name}`)")
 
-# ══ PAGE 1 ════════════════════════════════════════════════════════════════════
-if page == "📊 Overview & EDA":
-    st.title("Edmonton Building Permits")
-    st.caption(f"Construction value analysis · {len(df):,} real permits from the City of Edmonton Open Data Portal")
+# ══ Overview ═════════════════════════════════════════════════════════════════
+if page == "Overview":
+    st.title("Edmonton building permits")
+    st.caption(f"Declared construction value, permits between {money(MIN_VALUE)} and {money(MAX_VALUE)}")
+    c = st.columns(4)
+    c[0].metric("Permits", f"{len(df):,}")
+    c[1].metric("Total declared value", f"${df['value'].sum() / 1e9:.1f}B")
+    c[2].metric("Median permit", money(df["value"].median()))
+    c[3].metric("Mean permit", money(df["value"].mean()), help="Pulled far above the median by a few large projects.")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Permits", f"{len(df):,}")
-    c2.metric("Total value", f"${df['cv'].sum()/1e9:.1f}B")
-    c3.metric("Median value", f"${df['cv'].median():,.0f}")
-    c4.metric("Mean value", f"${df['cv'].mean():,.0f}")
-    c5.metric("Years", f"{df['YEAR'].min()}–{df['YEAR'].max()}")
-    st.markdown("---")
+    l, r = st.columns(2)
+    with l:
+        st.subheader("Value distribution")
+        fig = px.histogram(df, x="value", nbins=70, log_x=True, color_discrete_sequence=[BLUE])
+        st.plotly_chart(style(fig.update_xaxes(title="Declared value ($, log scale)")), width="stretch")
+    with r:
+        st.subheader("Median value by job category")
+        vc = df.groupby("JOB_CATEGORY")["value"].agg(["median", "size"]).query("size >= 30").sort_values("median")
+        fig = px.bar(vc.reset_index(), x="median", y="JOB_CATEGORY", orientation="h", color_discrete_sequence=[BLUE],
+                     hover_data={"size": True})
+        st.plotly_chart(style(fig.update_layout(xaxis_title="Median value ($)", yaxis_title="")), width="stretch")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-header">Construction value distribution (log scale)</div>', unsafe_allow_html=True)
-        fig = px.histogram(df, x='log_cv', nbins=60, color_discrete_sequence=['#3b82f6'], template='plotly_dark')
-        fig.update_xaxes(title='log₁₀(construction value $)')
-        fig.update_layout(height=320, showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.markdown('<div class="section-header">Permits issued per year</div>', unsafe_allow_html=True)
-        cby = df.groupby('YEAR').size().reset_index(name='count')
-        fig = px.bar(cby, x='YEAR', y='count', color_discrete_sequence=['#10b981'], template='plotly_dark')
-        fig.update_layout(height=320, showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
+    st.subheader("The job-category mix changes over time")
+    st.caption("Edmonton's permit system stopped issuing the 'Combination' categories after 2023, so recent permits "
+               "look different from the history the model learns from. This is why evaluation is done out-of-time.")
+    mix = df.groupby(["YEAR", "JOB_CATEGORY"]).size().reset_index(name="n")
+    mix["share"] = mix["n"] / mix.groupby("YEAR")["n"].transform("sum")
+    fig = px.area(mix, x="YEAR", y="share", color="JOB_CATEGORY")
+    st.plotly_chart(style(fig.update_layout(yaxis_tickformat=".0%", legend_title=""), 380), width="stretch")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-header">Median value by job category</div>', unsafe_allow_html=True)
-        vc = df.groupby('JOB_CATEGORY')['cv'].median().sort_values().reset_index()
-        fig = px.bar(vc, x='cv', y='JOB_CATEGORY', orientation='h', color='cv',
-                     color_continuous_scale='Blues', template='plotly_dark')
-        fig.update_xaxes(title='Median value ($)')
-        fig.update_layout(height=360, showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.markdown('<div class="section-header">Median value over time</div>', unsafe_allow_html=True)
-        vy = df.groupby('YEAR')['cv'].median().reset_index()
-        fig = px.line(vy, x='YEAR', y='cv', markers=True, color_discrete_sequence=['#f59e0b'], template='plotly_dark')
-        fig.update_yaxes(title='Median value ($)')
-        fig.update_layout(height=360, margin=dict(l=0, r=0, t=10, b=0),
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
+    l, r = st.columns(2)
+    with l:
+        st.subheader("Permits per year")
+        fig = px.bar(df.groupby("YEAR").size().reset_index(name="permits"), x="YEAR", y="permits",
+                     color_discrete_sequence=[GREEN])
+        st.plotly_chart(style(fig), width="stretch")
+    with r:
+        st.subheader("Median value per year (nominal $)")
+        fig = px.line(df.groupby("YEAR")["value"].median().reset_index(), x="YEAR", y="value", markers=True,
+                      color_discrete_sequence=[AMBER])
+        st.plotly_chart(style(fig.update_yaxes(title="Median value ($)")), width="stretch")
 
-    st.markdown('<div class="section-header">Top 15 neighbourhoods by total construction value</div>', unsafe_allow_html=True)
-    tn = df.groupby('NEIGHBOURHOOD')['cv'].sum().sort_values(ascending=False).head(15).reset_index()
-    fig = px.bar(tn, x='NEIGHBOURHOOD', y='cv', color='cv', color_continuous_scale='Viridis', template='plotly_dark')
-    fig.update_yaxes(title='Total value ($)')
-    fig.update_layout(height=380, showlegend=False, coloraxis_showscale=False,
-                      margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    fig.update_xaxes(tickangle=-40)
-    st.plotly_chart(fig, use_container_width=True)
+# ══ Model evaluation ═════════════════════════════════════════════════════════
+elif page == "Model evaluation":
+    st.title("Model evaluation")
+    st.markdown(
+        f"Models train on **{sp['train_years'][0]}–{sp['train_years'][1]}** ({sp['n_train']:,} permits), are compared on "
+        f"**{sp['valid_year']}** ({sp['n_valid']:,}) to pick a winner, and are scored once on **{test_label}** "
+        f"({sp['n_test']:,}) — years no model saw. Target: log₁₀(declared value)."
+    )
+    c = st.columns(4)
+    c[0].metric("R² (log value)", f"{best['r2_log']:.3f}")
+    c[1].metric("Median error", f"{best['median_ape']:.1f}%")
+    c[2].metric("Within ±25%", f"{best['within_25pct']:.0f}%")
+    c[3].metric("Within 2×", f"{best['within_2x']:.0f}%")
 
-# ══ PAGE 2 ════════════════════════════════════════════════════════════════════
-elif page == "🔬 Model Comparison":
-    st.title("Model Comparison")
-    n_test = int(round(len(df) * 0.2))
-    st.caption(f"5 models · target = log₁₀(construction value) · 80/20 train-test split on "
-               f"{len(df):,} permits ({n_test:,} held out)")
+    st.subheader(f"All models on {test_label}")
+    tbl = metrics.rename(columns={"r2_log": "R² (log)", "median_ape": "Median % error", "within_25pct": "Within ±25%",
+                                  "within_2x": "Within 2×", "mae_dollars": "Mean abs error ($)",
+                                  "selected": "Selected"})
+    st.dataframe(tbl.style.format({"R² (log)": "{:.3f}", "Median % error": "{:.1f}%", "Within ±25%": "{:.0f}%",
+                                   "Within 2×": "{:.0f}%", "Mean abs error ($)": "${:,.0f}"}),
+                 width="stretch")
+    st.caption("Mean absolute error in dollars is dominated by a handful of multi-million-dollar permits; "
+               "the percentage metrics describe a typical permit better.")
 
-    best = max(results, key=lambda x: results[x]['r2'])
-    best_mape = min(results, key=lambda x: results[x]['medape'])
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Best R²", f"{results[best]['r2']:.3f}", f"({best})")
-    c2.metric("Best median error", f"{results[best_mape]['medape']:.1f}%", f"({best_mape})")
-    c3.metric("Test set size", f"{n_test:,}", "held-out permits")
+    l, r = st.columns(2)
+    with l:
+        st.subheader("Why the split matters")
+        rnd = report.random_split_metrics
+        comp = pd.DataFrame({"Evaluation": ["Random 80/20 split", f"Out-of-time ({test_label})"],
+                             "R²": [rnd["r2_log"], best["r2_log"]]})
+        fig = px.bar(comp, x="Evaluation", y="R²", color="Evaluation", color_discrete_sequence=[GREY, BLUE], text_auto=".3f")
+        st.plotly_chart(style(fig.update_layout(showlegend=False, xaxis_title="")), width="stretch")
+        st.caption("A random split mixes years, so the model is partly tested on the same era it trained on. "
+                   "Its score is optimistic for predicting new permits.")
+    with r:
+        st.subheader("Error by job category")
+        tp = report.test_predictions.assign(ape=lambda d: (d["predicted"] - d["value"]).abs() / d["value"] * 100)
+        bc = tp.groupby("JOB_CATEGORY")["ape"].agg(["median", "size"]).query("size >= 20").sort_values("median")
+        fig = px.bar(bc.reset_index(), x="median", y="JOB_CATEGORY", orientation="h", color_discrete_sequence=[AMBER],
+                     hover_data={"size": True})
+        st.plotly_chart(style(fig.update_layout(xaxis_title="Median % error", yaxis_title="")), width="stretch")
+        st.caption("New houses are predictable from their size; renovations and commercial work vary much more.")
 
-    st.markdown('<div class="section-header">Performance metrics</div>', unsafe_allow_html=True)
-    tbl = pd.DataFrame({n: {'R² (log)': f"{v['r2']:.4f}", 'Mean abs error': f"${v['mae']:,.0f}",
-                            'Median abs % error': f"{v['medape']:.1f}%"} for n, v in results.items()}).T
-    tbl = tbl.reset_index().rename(columns={'index': 'Model'})
-    st.dataframe(tbl, use_container_width=True, hide_index=True)
+    st.subheader("Predicted vs actual")
+    tp = report.test_predictions
+    sample = tp.sample(min(2500, len(tp)), random_state=1)
+    fig = px.scatter(sample, x="value", y="predicted", color="JOB_CATEGORY", opacity=0.5, log_x=True, log_y=True)
+    lim = [sample[["value", "predicted"]].min().min(), sample[["value", "predicted"]].max().max()]
+    fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="Perfect", line=dict(color=RED, dash="dash")))
+    st.plotly_chart(style(fig.update_layout(xaxis_title="Actual ($)", yaxis_title="Predicted ($)", legend_title=""), 460),
+                    width="stretch")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="section-header">R² by model</div>', unsafe_allow_html=True)
-        rd = pd.DataFrame({'Model': list(results), 'R²': [v['r2'] for v in results.values()]})
-        fig = px.bar(rd, x='Model', y='R²', color='R²', color_continuous_scale='Blues', template='plotly_dark')
-        fig.update_layout(height=320, showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.markdown('<div class="section-header">Median % error by model</div>', unsafe_allow_html=True)
-        ed = pd.DataFrame({'Model': list(results), 'MedAPE': [v['medape'] for v in results.values()]})
-        fig = px.bar(ed, x='Model', y='MedAPE', color='MedAPE', color_continuous_scale='Reds_r', template='plotly_dark')
-        fig.update_yaxes(title='Median abs % error')
-        fig.update_layout(height=320, showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
+    cov = report.interval_coverage
+    st.subheader("Are the ranges honest?")
+    st.markdown(
+        f"Each prediction comes with an **{cov['level']:.0f}% range** calibrated on {sp['valid_year']} errors, separately "
+        f"for each job category. On {test_label} the true value fell inside it **{cov['test_coverage']:.0f}%** of the time. "
+        f"The typical range spans ÷/× **{cov['median_width_factor']:.1f}** around the estimate."
+    )
+    inside = (tp["value"] >= tp["lower"]) & (tp["value"] <= tp["upper"])
+    cc = inside.groupby(tp["JOB_CATEGORY"]).agg(["mean", "size"]).query("size >= 20")
+    fig = px.bar(cc.reset_index(), x="JOB_CATEGORY", y="mean", color_discrete_sequence=[GREEN], text_auto=".0%")
+    fig.add_hline(y=cov["level"] / 100, line_dash="dash", line_color=RED, annotation_text="target")
+    st.plotly_chart(style(fig.update_layout(yaxis_tickformat=".0%", yaxis_title="Coverage", xaxis_title="")),
+                    width="stretch")
 
-    st.markdown('<div class="section-header">XGBoost — predicted vs actual (log-log, 2k sample)</div>', unsafe_allow_html=True)
-    yt, pt = xgb_test
-    idx = np.random.RandomState(1).choice(len(yt), min(2000, len(yt)), replace=False)
-    sdf = pd.DataFrame({'Actual': yt[idx], 'Predicted': pt[idx]})
-    fig = px.scatter(sdf, x='Actual', y='Predicted', opacity=0.4, color_discrete_sequence=['#3b82f6'], template='plotly_dark')
-    lim = [max(500, sdf['Actual'].min()), sdf['Actual'].max()]
-    fig.add_trace(go.Scatter(x=lim, y=lim, mode='lines', name='Perfect', line=dict(color='#ef4444', dash='dash')))
-    fig.update_xaxes(type='log', title='Actual value ($)')
-    fig.update_yaxes(type='log', title='Predicted value ($)')
-    fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
-                      paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig, use_container_width=True)
+# ══ What drives value ════════════════════════════════════════════════════════
+elif page == "What drives value":
+    st.title("What drives construction value")
+    imp = report.importance
+    st.caption(f"Permutation importance on {test_label}: how much R² drops when one input is shuffled. "
+               "Measured on unseen years, so it reflects what the model actually relies on there.")
+    fig = px.bar(imp.sort_values("r2_drop"), x="r2_drop", y="label", orientation="h", error_x="r2_drop_std",
+                 color_discrete_sequence=[BLUE])
+    st.plotly_chart(style(fig.update_layout(xaxis_title="Drop in R² when shuffled", yaxis_title=""), 440),
+                    width="stretch")
 
-    st.info("Tree ensembles (R²≈0.84) crush linear models (R²≈0.56) here — construction value depends on "
-            "non-linear interactions between job category, building type, and floor area that linear regression "
-            "can't capture. Median error of ~17–19% is strong given only pre-build permit features.", icon="ℹ️")
+    top = imp.iloc[0]
+    location = imp[imp["feature"].isin(["NEIGHBOURHOOD", "ZONING", "latitude", "longitude"])]["r2_drop"].sum()
+    text_imp = imp.loc[imp["feature"] == "JOB_DESCRIPTION", "r2_drop"].sum()
+    st.markdown(
+        f"- **{top['label']}** matters most: shuffling it costs {top['r2_drop']:.2f} R².\n"
+        f"- The **free-text job description** is worth {text_imp:.2f} R² on top of the structured fields.\n"
+        f"- **Location** (neighbourhood, zoning, coordinates) costs {location:.3f} R² combined when shuffled. "
+        "That doesn't mean location doesn't affect cost. It means once the size and type of work are known, "
+        "location adds little predictive information."
+    )
 
-# ══ PAGE 3 ════════════════════════════════════════════════════════════════════
-elif page == "📈 Feature Analysis":
-    st.title("Feature Analysis")
-    st.caption("9 features from raw permit fields. Importance = XGBoost gain. "
-               "Note: UNITS_ADDED was deliberately dropped — it dominated importance but the model scored identically "
-               "without it, so the simpler, more interpretable feature set was kept.")
+    st.subheader("Floor area vs value")
+    has_fa = df.dropna(subset=["floor_area"])
+    s = has_fa.sample(min(4000, len(has_fa)), random_state=0)
+    fig = px.scatter(s, x="floor_area", y="value", color="JOB_CATEGORY", log_x=True, log_y=True, opacity=0.45)
+    st.plotly_chart(style(fig.update_layout(xaxis_title="Floor area (log)", yaxis_title="Declared value ($, log)",
+                                            legend_title=""), 460), width="stretch")
+    st.caption(f"{df['floor_area'].isna().mean():.0%} of permits have no floor area; "
+               "the model learns from missingness too, since small jobs often omit it.")
 
-    col1, col2 = st.columns([1.1, 0.9])
-    with col1:
-        st.markdown('<div class="section-header">XGBoost feature importance (% gain)</div>', unsafe_allow_html=True)
-        fi = pd.DataFrame({'Feature': list(importance), 'Importance': list(importance.values())}).sort_values('Importance')
-        fig = px.bar(fi, x='Importance', y='Feature', orientation='h', color='Importance',
-                     color_continuous_scale='Blues', template='plotly_dark')
-        fig.update_layout(height=400, showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.markdown('<div class="section-header">Key findings</div>', unsafe_allow_html=True)
-        st.markdown("""
-**Job Category** dominates (~57%)
-> What kind of work it is — commercial final, single-detached housing, home improvement — is the strongest single signal of value.
+# ══ Predict a permit ═════════════════════════════════════════════════════════
+elif page == "Predict a permit":
+    st.title("Estimate a permit's declared value")
+    cats, counts = report.meta["categories"], report.meta["category_counts"]
 
-**Floor Area** (~28%)
-> Bigger footprint, bigger budget. The log-transform linearizes a strongly skewed relationship.
+    st.caption("Work type, building type and zoning options are ordered by how often they occur with the chosen "
+               "job category, so the defaults form a realistic permit.")
 
-**Work Type** (~11%)
-> New build vs. interior alteration vs. demolition separates value tiers cleanly.
+    def pick(label, col, within=None):
+        # Most common levels first; when `within` is given, only levels seen together with it.
+        pool = df if within is None else df[df["JOB_CATEGORY"] == within]
+        options = pool[col].value_counts().index.tolist() or sorted(cats[col])
+        return st.selectbox(label, options)
 
-**Location barely matters**
-> Neighbourhood & zoning contribute <1% combined — surprising, but value is driven by *what* is built, not *where*.
-        """)
-
-    st.markdown('<div class="section-header">Value distribution by work type (top categories)</div>', unsafe_allow_html=True)
-    top_wt = df['WORK_TYPE'].value_counts().head(8).index
-    box_df = df[df['WORK_TYPE'].isin(top_wt)].copy()
-    fig = px.box(box_df, x='WORK_TYPE', y='cv', color='WORK_TYPE', template='plotly_dark')
-    fig.update_yaxes(type='log', title='Construction value ($, log)')
-    fig.update_xaxes(title='', tickangle=-30)
-    fig.update_layout(height=420, showlegend=False, margin=dict(l=0, r=0, t=10, b=0),
-                      paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig, use_container_width=True)
-
-# ══ PAGE 4 ════════════════════════════════════════════════════════════════════
-elif page == "🔮 Value Predictor":
-    st.title("Permit Value Predictor")
-    st.caption("Enter permit characteristics to estimate the declared construction value (XGBoost, R²=0.84).")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        job = st.selectbox("Job category", sorted(df['JOB_CATEGORY'].unique()))
-        building = st.selectbox("Building type", sorted(df['BUILDING_TYPE'].unique()))
-        work = st.selectbox("Work type", sorted(df['WORK_TYPE'].unique()))
-        year = st.slider("Year", 2024, 2030, 2026)
-    with col2:
-        neighbourhood = st.selectbox("Neighbourhood", sorted(df['NEIGHBOURHOOD_r'].unique()))
-        zoning = st.selectbox("Zoning", sorted(df['ZONING_r'].unique()))
+    l, r = st.columns(2)
+    with l:
+        job = pick("Job category", "JOB_CATEGORY")
+        work = pick("Work type", "WORK_TYPE", job)
+        building = pick("Building type", "BUILDING_TYPE", job)
+        floor_area = st.number_input("Floor area in sq ft (0 = unknown)", 0.0, 500_000.0, 0.0, 50.0)
+        units = st.number_input("Dwelling units added", -50, 500, 0)
+    with r:
+        neighbourhood = pick("Neighbourhood", "NEIGHBOURHOOD")
+        zoning = pick("Zoning", "ZONING", job)
+        year = st.slider("Permit year", report.meta["year_min"], report.meta["year_max"], report.meta["year_max"],
+                         help="Limited to years in the data; the model cannot forecast later years.")
         month = st.slider("Month", 1, 12, 6)
-        floor_area = st.number_input("Floor area (sq ft, 0 = unknown)", min_value=0, max_value=500000, value=2000, step=100)
+    desc = st.text_area("Job description (optional, but improves accuracy)",
+                        placeholder="To construct a Single Detached House with front attached Garage and Unenclosed Front Porch.")
 
-    if st.button("🔮 Predict Construction Value", type="primary"):
-        has_fa = 1 if floor_area > 0 else 0
-        fa_val = floor_area if floor_area > 0 else fa_median
+    if st.button("Estimate value", type="primary"):
+        centre = df.loc[df["NEIGHBOURHOOD"] == neighbourhood, ["latitude", "longitude"]].median()
+        row = pd.DataFrame([{
+            "JOB_CATEGORY": job, "WORK_TYPE": work, "BUILDING_TYPE": building, "ZONING": zoning,
+            "NEIGHBOURHOOD": neighbourhood, "floor_area": floor_area or np.nan,
+            "desc_area": description_area(desc), "YEAR": year, "MONTH_NUMBER": month,
+            "units_added": units, "latitude": centre["latitude"], "longitude": centre["longitude"],
+            "JOB_DESCRIPTION": desc or "",
+        }])[ALL_FEATURES]
+        out = predict_with_interval(report, row).iloc[0]
+        c = st.columns(3)
+        c[0].metric("Estimate", money(out["predicted"]))
+        c[1].metric(f"{report.intervals.level:.0%} range — low", money(out["lower"]))
+        c[2].metric(f"{report.intervals.level:.0%} range — high", money(out["upper"]))
+        st.caption("The estimate is a typical (median-like) value for permits like this. Ranges are calibrated on "
+                   "held-out years per job category; the range is wider where past predictions were less accurate.")
+        n_job = counts["JOB_CATEGORY"].get(job, 0)
+        if n_job < 200:
+            st.warning(f"Only {n_job} permits in '{job}' — treat this estimate with extra caution.")
+        if not desc:
+            st.info("Adding the job description usually tightens the estimate.")
 
-        def enc(col, val):
-            le = encoders[col]
-            if val in le.classes_:
-                return int(le.transform([val])[0])
-            for fallback in ('Unknown', 'Other'):
-                if fallback in le.classes_:
-                    return int(le.transform([fallback])[0])
-            return 0
-
-        row = {
-            'years_since_2009': year - 2009, 'MONTH_NUMBER': month,
-            'has_floor_area': has_fa, 'log_fa': np.log1p(max(fa_val, 0)),
-            'JOB_CATEGORY_enc': enc('JOB_CATEGORY', job),
-            'BUILDING_TYPE_enc': enc('BUILDING_TYPE', building),
-            'WORK_TYPE_enc': enc('WORK_TYPE', work),
-            'NEIGHBOURHOOD_r_enc': enc('NEIGHBOURHOOD_r', neighbourhood),
-            'ZONING_r_enc': enc('ZONING_r', zoning),
-        }
-        Xin = pd.DataFrame([row])[FEATURE_COLS]
-
-        log_pred = float(models['XGBoost'].predict(Xin)[0])
-        value = 10 ** log_pred
-        # rough ±band using model median % error
-        band = results['XGBoost']['medape'] / 100
-
-        st.markdown("---")
-        st.markdown("### Prediction")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Estimated value", f"${value:,.0f}")
-        m2.metric("Likely range (low)", f"${value*(1-band):,.0f}")
-        m3.metric("Likely range (high)", f"${value*(1+band):,.0f}")
-
-        all_preds = {n: 10 ** float(m.predict(Xin)[0]) for n, m in models.items()}
-        pdf = pd.DataFrame({'Model': list(all_preds), 'Predicted ($)': list(all_preds.values())})
-        fig = px.bar(pdf, x='Model', y='Predicted ($)', color='Predicted ($)',
-                     color_continuous_scale='Blues', template='plotly_dark')
-        fig.update_layout(height=320, showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"Range reflects the model's median absolute error of ±{band*100:.0f}% on held-out data.")
+# ══ Limitations ══════════════════════════════════════════════════════════════
+else:
+    st.title("Limitations")
+    rnd = report.random_split_metrics
+    tp = report.test_predictions
+    by_job = ((tp["predicted"] - tp["value"]).abs() / tp["value"] * 100).groupby(tp["JOB_CATEGORY"]).agg(["median", "size"])
+    by_job = by_job[by_job["size"] >= 20].sort_values("median")
+    easiest, hardest = by_job.index[0], by_job.index[-1]
+    st.markdown(f"""
+- **Declared, not actual, cost.** The target is the value applicants write on the permit. It is self-reported,
+  often rounded, and may be understated. The model predicts what will be declared, not what the project will cost.
+- **Range of validity.** Permits under {money(MIN_VALUE)} or over {money(MAX_VALUE)} were removed as placeholders or
+  outliers. Estimates outside that range are not supported.
+- **The world shifts.** Job categories were reorganised after 2023, and some fields (e.g. units added) are missing
+  more often in recent years. Out-of-time R² is {best['r2_log']:.2f} versus {rnd['r2_log']:.2f} on a random split.
+  Expect accuracy to keep drifting unless the model is retrained on recent permits.
+- **No forecasting.** Tree models can't extrapolate a time trend, and values are in nominal dollars, not adjusted
+  for inflation. Predictions are for the conditions of the most recent years in the data.
+- **Uneven accuracy.** Median error on {test_label} ranges from {by_job.loc[easiest, 'median']:.0f}% for
+  '{easiest}' to {by_job.loc[hardest, 'median']:.0f}% for '{hardest}'. Ranges are correspondingly wider for the
+  harder categories.
+- **Range coverage is approximate.** The {report.intervals.level:.0%} ranges came out at
+  {report.interval_coverage['test_coverage']:.0f}% coverage on {test_label}; the shift between years makes exact
+  coverage impossible to guarantee.
+- **Importance is not causation.** Permutation importance says what the model relies on, not what makes
+  construction expensive. Correlated inputs (floor area and description dimensions; neighbourhood and coordinates)
+  share credit.
+- **Sample vs full data.** The repository ships a {len(df):,}-permit sample when using the default file.
+  Results on the full export will differ somewhat.
+""")

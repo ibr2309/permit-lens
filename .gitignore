@@ -34,3 +34,9 @@ desktop.ini
 
 # Full dataset (only the sample ships with the repo)
 General_Building_Permits.csv
+
+# Tests
+.pytest_cache/
+
+# Trained model bundles are pickles tied to library versions; rebuild with `python -m permit_lens.train`.
+artifacts/*.joblib
