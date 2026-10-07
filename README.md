@@ -101,7 +101,7 @@ tests/         pytest suite (runs in CI)
 - **Accuracy drifts as the city's data practices change.** Retrain on recent permits to keep up.
 - **Feature importance is not causation.** Correlated inputs share credit.
 - **Results are from the sample only.** Numbers on the full ~200k-permit export haven't been re-run with this
-  version.
+  version
 
 ## Development
 
